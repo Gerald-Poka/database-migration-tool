@@ -1,0 +1,45 @@
+[project]
+name = "ferry"
+version = "0.1.0"
+description = "Agent-assisted, plan-driven migration with a first-class MySQL-to-PostgreSQL path and SQLite support."
+requires-python = ">=3.10"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "typer>=0.12",
+    "rich>=13",
+    "pyyaml>=6",
+    "pymysql",
+    "psycopg[binary]>=3.2",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=8", "ruff"]
+
+[project.scripts]
+ferry = "ferry.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ferry*"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "PL", "RUF", "UP"]
+ignore = [
+    "B008",     # typer Option/Argument defaults are the idiomatic style
+    "PLC0415",  # deferred imports are deliberate (cyclical/latency reasons)
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917",  # complexity caps off until v1
+    "PLR2004",  # numeric magic values fine in tests/small helpers
+    "PLW0108",
+    "RUF100",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"ferry/engine/*.py" = ["BLE001"]      # evidence gatherers must survive per-table errors
+"ferry/cli.py" = ["BLE001"]
