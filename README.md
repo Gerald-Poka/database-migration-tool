@@ -6,6 +6,17 @@ contains migration decisions; the engine does not infer business rules while cop
 
 This project is licensed under the [BSD 3-Clause License](./LICENSE).
 
+## Contributors
+
+- **Gerald Ndyamukama** — project author and maintainer.
+- **OpenAI Codex** — AI-assisted code and documentation contributions, made in collaboration
+  with the project maintainer.
+- **GitHub Copilot** — AI-assisted code contributions, made in collaboration with the project
+  maintainer.
+
+AI-assisted contributions are reviewed and maintained by the project maintainer. See
+[CONTRIBUTORS.md](./CONTRIBUTORS.md) for the contributor list.
+
 It was shaped by a large MySQL-to-PostgreSQL migration. That experience motivated features such as
 foreign-key ordering, chunked loads, explicit ID transforms, resumable table checkpoints, and
 row-count/orphan checks. Those features reduce risk, but cannot guarantee that every database,
