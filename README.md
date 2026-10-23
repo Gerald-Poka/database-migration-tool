@@ -15,16 +15,20 @@ schema, plan, or migration will succeed without testing against the actual syste
 
 | Database/dialect | Status | Notes |
 |---|---|---|
-| MySQL (`mysql+pymysql`) | Supported source and target | MySQL-to-PostgreSQL is the first-class migration path. |
-| PostgreSQL (`postgresql+psycopg`) | Supported source and target | PostgreSQL targets use `COPY` for `truncate` mappings and create `ferry_meta` bookkeeping tables by default. |
-| SQLite (`sqlite`) | Supported source and target | Intended for local development and tests; round-trip behavior is covered by the test suite. |
-| Other SQLAlchemy dialects | Not supported for execution | The executor rejects dialects other than PostgreSQL, MySQL, and SQLite. Generic SQLAlchemy profiling may work for other dialects, but it is not an end-to-end support promise. |
+| PostgreSQL (`postgresql+psycopg`) | Source and target; live-tested | PostgreSQL target bookkeeping is enabled by default. |
+| MySQL (`mysql+pymysql`) | Source and target; live-tested | Native MySQL upsert path; MySQL-to-PostgreSQL is the first-class migration path. |
+| MariaDB (`mariadb+pymysql`) | Source and target; live-tested | Uses the MySQL-compatible SQLAlchemy driver path. |
+| SQLite (`sqlite`) | Source and target; tested | Useful for local development, tests, and small migrations. |
+| CockroachDB (`cockroachdb+psycopg`) | Source and target; live-tested | Install the `cockroach` extra. Use its dedicated SQLAlchemy dialect rather than `postgresql+psycopg`. |
+| DuckDB (`duckdb`) | Source and target; live-tested | Install the `duckdb` extra. DuckDB catalog reflection uses Ferry's adapter. |
+| ClickHouse (`clickhousedb+connect`) | Source only; live-tested | Install the `clickhouse` extra. ClickHouse is rejected as a target. |
+| SQL Server (`mssql+pyodbc`) | Adapter available; not live-tested | Requires `pyodbc` and a compatible system ODBC driver. |
+| Oracle (`oracle+oracledb`) | Adapter available; not live-tested | Uses python-oracledb thin mode by default. |
 
-The MySQL and PostgreSQL code paths are implemented, but this repository's automated migration
-tests use SQLite; the MySQL-to-PostgreSQL path is not exercised by those tests. Before using it
-for important data, rehearse with representative MySQL and PostgreSQL versions, drivers, schemas,
-collations, types, constraints, and data volumes. SQLite passing tests does not certify live
-MySQL/PostgreSQL behavior.
+“Live-tested” means the checked-in suite has exercised basic migration against the indicated
+engine(s); it does not certify every release, type, schema feature, scale, or production topology.
+SQL Server and Oracle need live integration coverage before relying on them for important data.
+Schema/DDL migration is out of scope: the target schema must already exist.
 
 ## What ferry does
 
@@ -57,6 +61,10 @@ python3 -m venv .venv
 .venv/bin/ferry --help
 ```
 
+Install a database driver's extra when needed, for example `.venv/bin/pip install -e ".[duckdb]"`.
+The `all-sql` extra installs the Python adapters for the listed SQL databases. SQL Server also
+requires an OS-level ODBC driver.
+
 For the optional MCP server:
 
 ```bash
@@ -77,6 +85,9 @@ mysql+pymysql://USER:PASSWORD@HOST:3306/DATABASE
 postgresql+psycopg://USER:PASSWORD@HOST:5432/DATABASE
 sqlite:////absolute/path/to/database.db
 sqlite:///relative/path/to/database.db
+cockroachdb+psycopg://USER@HOST:26257/DATABASE?sslmode=disable
+duckdb:////absolute/path/to/database.duckdb
+clickhousedb+connect://USER:PASSWORD@HOST:8123/DATABASE
 ```
 
 URL passwords may need URL encoding for reserved characters. Do not commit real credentials or
@@ -160,7 +171,7 @@ See [docs/PLAN_SPEC.md](./docs/PLAN_SPEC.md) for all supported plan keys and tra
 
 ### Mapping options
 
-- `source`, `target`: table names; PostgreSQL tables may be schema-qualified.
+- `source`, `target`: table names; schema qualification depends on the selected dialect.
 - `columns`: source-column to target-column renames.
 - `skip`: source columns not loaded.
 - `transforms`: target-column transform specifications.
@@ -197,11 +208,12 @@ live beside the plan file; treat them as executable trusted code.
 - For `merge`, choose a correct unique conflict key. Count verification only checks that target
   count is at least the selected source count, because target-only rows are allowed; this does not
   prove every source row matched or every value is correct.
-- PostgreSQL `COPY` preserves explicit values, but ferry does not currently promise to advance
-  PostgreSQL identity/serial sequences after loading. Check and, if needed, repair sequences before
-  applications resume writes.
+- Ferry does not currently promise to advance PostgreSQL identity/serial sequences after loading.
+  Check and, if needed, repair sequences before applications resume writes.
 - PostgreSQL targets get `ferry_meta` run and mapping logs by default; other targets do not. Set
   `meta.schema: false` to disable bookkeeping.
+- SQL Server and Oracle merge use a portable update-then-insert fallback. It is not atomic against
+  concurrent writers; serialize writes or use truncate when that behavior is not acceptable.
 - Back up data, review URLs/filters/transforms/ID contracts, run a dry run, and test on a staging
   copy before production. A dry run validates useful configuration but does not prove the load will
   succeed.
@@ -220,8 +232,23 @@ mapping choices, filters, transforms, ID offsets, and destructive strategy befor
 .venv/bin/ruff check ferry tests
 ```
 
-The current automated tests primarily exercise SQLite; they do not replace integration tests
-against the production database engines and representative data.
+Optional live tests use the URLs in these environment variables:
+
+```bash
+docker compose -f tests/integration/compose.yaml up -d --wait
+FERRY_TEST_POSTGRES_URL='postgresql+psycopg://postgres:ferrytest@127.0.0.1:55432/ferrytest' \
+FERRY_TEST_MYSQL_URL='mysql+pymysql://root:ferrytest@127.0.0.1:53306/ferrytest' \
+FERRY_TEST_MARIADB_URL='mariadb+pymysql://root:ferrytest@127.0.0.1:53307/ferrytest' \
+FERRY_TEST_CLICKHOUSE_URL='clickhousedb+connect://default:ferrytest@127.0.0.1:58123/default' \
+  .venv/bin/pytest tests/test_sql_integration.py -q
+docker compose -f tests/integration/compose.yaml down
+```
+
+The live test module also accepts `FERRY_TEST_COCKROACH_URL`, for example
+`cockroachdb+psycopg://root@127.0.0.1:26257/defaultdb?sslmode=disable`. DuckDB is tested locally
+by `tests/test_duckdb.py`; PostgreSQL, MySQL, MariaDB, CockroachDB, and ClickHouse tests are opt-in
+and skip when their URLs are absent. Always rehearse with representative production versions and
+data.
 
 ## Current limitations
 
@@ -230,4 +257,5 @@ against the production database engines and representative data.
 - Multi-table FK cycles need manual handling.
 - No automatic PostgreSQL sequence advancement after explicit ID loads.
 - Non-PostgreSQL targets do not receive `ferry_meta` bookkeeping.
-- Other SQLAlchemy dialects are not supported for execution.
+- SQL Server and Oracle adapters have not yet been exercised against live services in this
+  project's integration suite.

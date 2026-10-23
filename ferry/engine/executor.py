@@ -3,7 +3,7 @@
 Execution model:
 - waves are topologically ordered on target FKs (plan `order:` overrides).
 - truncate strategy: reverse-order DELETE pass over all truncate-mapped targets,
-  then topological COPY/INSERT. PG bulk loads use COPY TEXT (fast, streaming).
+  then topological streaming INSERT batches.
 - merge strategy: conflict-aware INSERT ... ON CONFLICT / ON DUPLICATE / OR REPLACE.
 - re-runs resume from <plan>.ferry/<run_id>/checkpoint.json (done tables skipped).
 - every run writes run_log/migration_log in the target's `ferry_meta` schema (PG).
@@ -11,17 +11,27 @@ Execution model:
 
 from __future__ import annotations
 
-import io
 import json
 import time
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import inspect
+from sqlalchemy import and_, delete, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .connect import count_select_sql, make_engine, quote, scalar, split_target
+from .connect import make_engine
 from .meta import MetaLog
 from .plan import Plan, PlanError
+from .sql import (
+    SOURCE_DIALECTS,
+    TARGET_DIALECTS,
+    reflect_table,
+    source_count,
+    source_select,
+    table_metadata,
+)
 from .transforms import compile_transforms
 from .waves import plan_waves
 
@@ -30,36 +40,6 @@ OK, ERR = "ok", "error"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _copy_text(v) -> str:
-    """Encode one field for PG COPY TEXT; plain \\N is COPY's null marker."""
-    if v is None:
-        return "\\N"
-    if isinstance(v, bool):
-        return "t" if v else "f"
-    if isinstance(v, float):
-        if v != v:  # noqa: PLR0124 nan != nan by design
-            return "NaN"
-        if v == float("inf"):
-            return "Infinity"
-        if v == float("-inf"):
-            return "-Infinity"
-        return repr(v)
-    if isinstance(v, (bytes, bytearray, memoryview)):
-        return "\\x" + v.hex().replace("\\", "\\\\")
-    if isinstance(v, datetime):
-        s = v.isoformat(sep=" ")
-    elif hasattr(v, "isoformat"):
-        s = v.isoformat()
-    else:
-        s = str(v)
-    return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
-
-
-def _ph(n: int, dialect: str) -> str:
-    p = "?" if dialect == "sqlite" else "%s"
-    return ", ".join([p] * n)
 
 
 class Executor:
@@ -84,18 +64,11 @@ class Executor:
             self.checkpoints = json.loads(self.checkpoint_file.read_text())
         self.source = make_engine(plan.source_url)
         self.target = make_engine(plan.target_url)
-        self.meta = MetaLog(lambda: self._tconn(), self.target.dialect.name,
+        self.meta = MetaLog(lambda: self.target.raw_connection(), self.target.dialect.name,
                             plan.meta_schema, plan.meta_enabled)
         self.report: dict = {"run_id": self.run_id, "started_at": _now(), "mappings": {}}
 
     # -------------------------------------------------------------- infra helpers
-
-    def _tconn(self):
-        """Pooled target connection proxy (psycopg / pymysql / sqlite3)."""
-        return self.target.raw_connection()
-
-    def _sconn(self):
-        return self.source.raw_connection()
 
     def _log_magline(self, *a):
         if self.echo:
@@ -113,20 +86,20 @@ class Executor:
 
     def _waves(self) -> list[list[dict]]:
         """Attach target evidence to each mapping and return waves (lists of mappings)."""
-        tinsp = inspect(self.target)
-        dialect = self.target.dialect.name
         for m in self.plan.mappings:
-            schema, table = split_target(m["target"])
             try:
-                cols = tinsp.get_columns(table, schema=schema if dialect == "postgresql" else None)
+                target_table = reflect_table(self.target, m["target"])
             except Exception as e:
                 raise PlanError(
                     f"target table {m['target']!r} not found on target (engine assumes the "
                     f"target schema is pre-created: {e!r})") from e
+            evidence = table_metadata(self.target, m["target"])
+            cols = evidence["columns"]
+            m["_target_table"] = target_table
             m["_target_cols"] = [c["name"] for c in cols]
             m["_target_column_info"] = {c["name"]: c for c in cols}
-            m["_target_pk"] = tinsp.get_pk_constraint(table, schema=schema)["constrained_columns"]
-            m["_target_uniques"] = tinsp.get_unique_constraints(table, schema=schema)
+            m["_target_pk"] = evidence["primary_key"]
+            m["_target_uniques"] = evidence["unique_constraints"]
             m["_target_fks"] = [
                 {
                     "name": fk["name"],
@@ -136,7 +109,7 @@ class Executor:
                         if fk.get("referred_schema") else fk["referred_table"]
                     ),
                 }
-                for fk in tinsp.get_foreign_keys(table, schema=schema)
+                for fk in evidence["foreign_keys"]
             ]
         if self.plan.order:
             order = self.plan.order
@@ -149,31 +122,32 @@ class Executor:
             raise PlanError(str(e)) from e
 
     def _inspect_sources(self) -> dict:
-        sin = inspect(self.source)
-        sdialect = self.source.dialect.name
-        columns_by_source = {}
+        tables_by_source = {}
         out = {}
         for m in self.plan.mappings:
             src = m["source"]
-            if src not in columns_by_source:
-                schema, table = None, src
-                if "." in src and sdialect == "postgresql":
-                    schema, _, table = src.rpartition(".")
-                columns_by_source[src] = [c["name"] for c in sin.get_columns(table, schema=schema)]
-            count_sql = count_select_sql(src, sdialect, m.get("where"), m.get("limit"))
-            with self.source.connect() as conn:
-                count = scalar(conn, count_sql)
-            out[m["target"]] = {"columns": columns_by_source[src], "count": count}
+            if src not in tables_by_source:
+                tables_by_source[src] = reflect_table(self.source, src)
+            source_table = tables_by_source[src]
+            count = source_count(self.source, source_table, m.get("where"), m.get("limit"))
+            out[m["target"]] = {
+                "columns": [column.name for column in source_table.columns],
+                "count": count,
+                "_table": source_table,
+            }
         return out
 
     # -------------------------------------------------------------- main loop
 
     def run(self) -> dict:
         self._log_magline(f"ferry {self.run_id}: {self.plan.summary()}")
-        supported = {"postgresql", "mysql", "sqlite"}
-        if self.source.dialect.name not in supported or self.target.dialect.name not in supported:
+        if (self.source.dialect.name not in SOURCE_DIALECTS
+                or self.target.dialect.name not in TARGET_DIALECTS):
             raise PlanError(
-                "supported database dialects are PostgreSQL, MySQL, and SQLite "
+                "supported source dialects are PostgreSQL, MySQL/MariaDB, SQLite, SQL Server, "
+                "Oracle, CockroachDB, and DuckDB, plus ClickHouse (clickhousedb) as a source. "
+                "ClickHouse is not "
+                "a supported target. "
                 f"(got source={self.source.dialect.name!r}, target={self.target.dialect.name!r})")
         waves = self._waves()
         sources = self._inspect_sources()
@@ -243,9 +217,8 @@ class Executor:
     # -------------------------------------------------------------- delete pass
 
     def _truncate(self, target: str):
-        dialect = self.target.dialect.name
         with self.target.begin() as txn:
-            txn.exec_driver_sql(f"DELETE FROM {quote(target, dialect)}")
+            txn.execute(delete(reflect_table(self.target, target)))
 
     # -------------------------------------------------------------- per mapping
 
@@ -312,146 +285,79 @@ class Executor:
 
     def _migrate(self, wi: int, m: dict, sin: dict) -> int:
         src_cols, tgt_cols = self._cols(m, sin)
-        select = self._select_sql(src_cols, m)
+        statement = source_select(sin["_table"], src_cols, m.get("where"), m.get("limit"))
         tf = m["_compiled_transforms"]
         conflict_cols = None
         if m["strategy"] == "merge":
             conflict_cols = _conflict_cols(m["conflict"], m["_target_pk"], m["_target_uniques"], m["target"])
-        if self.target.dialect.name == "postgresql" and m["strategy"] == "truncate":
-            return self._load_pg_copy(m["target"], tgt_cols, select, src_cols, tf, m["chunk"])
-        return self._load_executemany(m, tgt_cols, select, src_cols, tf, conflict_cols, m["chunk"])
-
-    def _select_sql(self, src_cols: list[str], m: dict) -> str:
-        dialect = self.source.dialect.name
-        cols = ", ".join(quote(c, dialect) for c in src_cols)
-        cond = f" WHERE {m['where']}" if m.get("where") else ""
-        limit = f" LIMIT {int(m['limit'])}" if m.get("limit") is not None else ""
-        return f"SELECT {cols} FROM {quote(m['source'], dialect)}{cond}{limit}"
-
-    # -------------------------------------------------------------- loaders
-
-    def _load_pg_copy(self, target: str, tgt_cols: list[str], select: str,
-                      src_cols: list[str], tf: dict, chunk: int) -> int:
-        dconn = self._tconn()
-        sconn = self._sconn()
-        cur = None
-        try:
-            if self.source.dialect.name == "mysql":
-                from pymysql.cursors import SSCursor
-                cur = sconn.cursor(SSCursor)
-            else:
-                cur = sconn.cursor()
-            cur.execute(select)
-            table_qual = quote(target, "postgresql")
-            cols_qual = ", ".join(quote(c, "postgresql") for c in tgt_cols)
-            total = 0
-            while True:
-                rows = cur.fetchmany(chunk)
-                if not rows:
-                    break
-                sio = io.StringIO()
-                for row in rows:
-                    vals = []
-                    for i, tc in enumerate(tgt_cols):
-                        v = row[i]  # SELECT order == tgt_cols order (aligned in _cols)
-                        fn = tf.get(tc)
-                        if fn is not None:
-                            v = fn(v)
-                        vals.append(v)
-                    sio.write("\t".join(_copy_text(v) for v in vals) + "\n")
-                with dconn.cursor() as pcur:
-                    with pcur.copy(f"COPY {table_qual} ({cols_qual}) FROM STDIN") as cp:
-                        cp.write(sio.getvalue().encode())
-                dconn.commit()
-                total += len(rows)
-            return total
-        except Exception:
-            dconn.rollback()
-            raise
-        finally:
+        target_table = m["_target_table"]
+        total = 0
+        with self.source.connect().execution_options(
+                stream_results=True, yield_per=m["chunk"]) as source_conn:
+            result = source_conn.execute(statement)
             try:
-                if cur is not None:
-                    cur.close()
+                while rows := result.fetchmany(m["chunk"]):
+                    batch = []
+                    for row in rows:
+                        values = {}
+                        for source_col, target_col in zip(src_cols, tgt_cols, strict=True):
+                            value = row._mapping[source_col]
+                            transform = tf.get(target_col)
+                            values[target_col] = transform(value) if transform is not None else value
+                        batch.append(values)
+                    with self.target.begin() as target_conn:
+                        if conflict_cols:
+                            self._merge_batch(target_conn, target_table, batch, conflict_cols)
+                        else:
+                            target_conn.execute(target_table.insert(), batch)
+                    total += len(batch)
             finally:
-                try:
-                    sconn.close()
-                finally:
-                    dconn.close()
+                result.close()
+        return total
 
-    def _load_executemany(self, m: dict, tgt_cols: list[str], select: str,
-                          src_cols: list[str], tf: dict, conflict_cols, chunk: int) -> int:
+    def _merge_batch(self, conn, table, rows: list[dict], conflict_cols: list[str]) -> None:
         dialect = self.target.dialect.name
-        table_qual = quote(m["target"], dialect)
-        or_kw, upsert = "", ""
-        if conflict_cols:
-            if dialect == "postgresql":
-                sets = ", ".join(f"{quote(c, dialect)} = EXCLUDED.{quote(c, dialect)}"
-                                 for c in tgt_cols if c not in conflict_cols)
-                upsert = ("ON CONFLICT (" + ", ".join(quote(c, dialect) for c in conflict_cols) + ")"
-                          + (f" DO UPDATE SET {sets}" if sets else " DO NOTHING"))
-            elif dialect == "mysql":
-                sets = ", ".join(f"{quote(c, dialect)} = VALUES({quote(c, dialect)})"
-                                 for c in tgt_cols if c not in conflict_cols)
-                no_op = f"{quote(conflict_cols[0], dialect)} = {quote(conflict_cols[0], dialect)}"
-                upsert = f"ON DUPLICATE KEY UPDATE {sets or no_op}"
-            elif dialect == "sqlite":
-                sets = ", ".join(f"{quote(c, dialect)} = excluded.{quote(c, dialect)}"
-                                 for c in tgt_cols if c not in conflict_cols)
-                upsert = ("ON CONFLICT (" + ", ".join(quote(c, dialect) for c in conflict_cols) + ")"
-                          + (f" DO UPDATE SET {sets}" if sets else " DO NOTHING"))
-            else:
-                raise PlanError(f"merge is not supported for target dialect {dialect!r}")
-        insert = (f"INSERT{or_kw} INTO {table_qual} ({_qlist(tgt_cols, dialect)}) "
-                  f"VALUES ({_ph(len(tgt_cols), dialect)}) {upsert}".strip())
-        sconn = self._sconn()
-        dconn = self._tconn()
-        cur = None
-        try:
-            if self.source.dialect.name == "mysql":
-                from pymysql.cursors import SSCursor
-                cur = sconn.cursor(SSCursor)
-            else:
-                cur = sconn.cursor()
-            cur.execute(select)
-            total = 0
-            while True:
-                rows = cur.fetchmany(chunk)
-                if not rows:
-                    break
-                batch = []
-                for row in rows:
-                    vals = []
-                    for i, tc in enumerate(tgt_cols):
-                        v = row[i]
-                        fn = tf.get(tc)
-                        if fn is not None:
-                            v = fn(v)
-                        vals.append(v)
-                    batch.append(tuple(vals))
-                pcur = dconn.cursor()
+        if not set(conflict_cols).issubset(rows[0]):
+            raise PlanError(
+                f"{table.fullname}: merge conflict columns must be included in the loaded columns")
+        if dialect in ("postgresql", "cockroachdb", "sqlite", "duckdb"):
+            if dialect == "sqlite":
+                insert_factory = sqlite_insert
+            elif dialect == "duckdb":
                 try:
-                    pcur.executemany(insert, batch)
-                finally:
-                    pcur.close()
-                dconn.commit()
-                total += len(rows)
-            return total
-        except Exception:
-            dconn.rollback()
-            raise
-        finally:
-            try:
-                if cur is not None:
-                    cur.close()
-            finally:
-                try:
-                    sconn.close()
-                finally:
-                    dconn.close()
+                    from duckdb_engine import insert as insert_factory
+                except ImportError as e:
+                    raise PlanError("DuckDB merge requires the duckdb-engine package") from e
+            else:
+                insert_factory = postgresql_insert
+            statement = insert_factory(table).values(rows)
+            updates = {key: statement.excluded[key] for key in rows[0] if key not in conflict_cols}
+            statement = (statement.on_conflict_do_update(
+                index_elements=[table.c[key] for key in conflict_cols], set_=updates)
+                if updates else statement.on_conflict_do_nothing(
+                    index_elements=[table.c[key] for key in conflict_cols]))
+            conn.execute(statement)
+            return
+        if dialect in ("mysql", "mariadb"):
+            statement = mysql_insert(table).values(rows)
+            updates = {key: statement.inserted[key] for key in rows[0] if key not in conflict_cols}
+            if not updates:
+                key = conflict_cols[0]
+                updates[key] = table.c[key]
+            conn.execute(statement.on_duplicate_key_update(**updates))
+            return
 
-
-def _qlist(cols: list[str], dialect: str) -> str:
-    return ", ".join(quote(c, dialect) for c in cols)
+        mutable_cols = [key for key in rows[0] if key not in conflict_cols]
+        for row in rows:
+            predicate = and_(*(table.c[key] == row[key] for key in conflict_cols))
+            exists = conn.execute(select(*[table.c[key] for key in conflict_cols])
+                                  .where(predicate).limit(1)).first()
+            if exists:
+                if mutable_cols:
+                    conn.execute(update(table).where(predicate).values(
+                        {key: row[key] for key in mutable_cols}))
+            else:
+                conn.execute(table.insert().values(row))
 
 
 def _conflict_cols(conflict, pk: list[str], uniques: list[dict], target: str) -> list[str] | None:

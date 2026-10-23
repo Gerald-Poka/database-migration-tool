@@ -1,7 +1,7 @@
 [project]
 name = "ferry"
 version = "0.1.0"
-description = "Agent-assisted, plan-driven migration with a first-class MySQL-to-PostgreSQL path and SQLite support."
+description = "Agent-assisted, plan-driven relational SQL data migration."
 requires-python = ">=3.10"
 dependencies = [
     "sqlalchemy>=2.0",
@@ -15,6 +15,23 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
 dev = ["pytest>=8", "ruff"]
+mysql = ["pymysql"]
+postgresql = ["psycopg[binary]>=3.2"]
+mssql = ["pyodbc>=5"]
+oracle = ["oracledb>=2"]
+cockroach = ["sqlalchemy-cockroachdb>=2.0.4"]
+duckdb = ["duckdb-engine>=0.13", "duckdb>=1.0,<2"]
+clickhouse = ["clickhouse-connect>=0.8"]
+all-sql = [
+    "pymysql",
+    "psycopg[binary]>=3.2",
+    "sqlalchemy-cockroachdb>=2.0.4",
+    "pyodbc>=5",
+    "oracledb>=2",
+    "duckdb-engine>=0.13",
+    "duckdb>=1.0,<2",
+    "clickhouse-connect>=0.8",
+]
 
 [project.scripts]
 ferry = "ferry.cli:app"

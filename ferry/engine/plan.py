@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from .sql import SCHEMA_DIALECTS
+
 
 class PlanError(Exception):
     pass
@@ -121,11 +123,11 @@ class Plan:
 def draft_plan(source_profile: dict, target_profile: dict, source_url: str, target_url: str) -> dict:
     """Draft unambiguous same-name mappings; flag schema collisions for review."""
     source_candidates: dict[str, list[str]] = {}
-    source_is_pg = source_profile.get("dialect") == "postgresql"
+    source_has_schemas = source_profile.get("dialect") in SCHEMA_DIALECTS
     for schema, tables in source_profile.get("schemas", {}).items():
         for name, t in tables.items():
             if t.get("rowcount", -1) >= 0:
-                source_name = f"{schema}.{name}" if source_is_pg and schema != "_default" else name
+                source_name = f"{schema}.{name}" if source_has_schemas and schema != "_default" else name
                 source_candidates.setdefault(name, []).append(source_name)
     target_candidates: dict[str, list[str]] = {}
     for schema, tables in target_profile.get("schemas", {}).items():

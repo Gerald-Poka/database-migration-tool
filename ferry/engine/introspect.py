@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.engine import Engine
 
-from .connect import scalar
+from .sql import SCHEMA_DIALECTS, reflect_table, table_metadata
 
 DEFAULT_SKIP_SCHEMAS = {"information_schema", "pg_catalog", "performance_schema", "sys", "mysql"}
 
@@ -29,8 +29,21 @@ def profile_engine(eng: Engine, schemas: list[str] | None = None, sample: int = 
             schemas = [r[0] for r in rows]
         elif dialect == "sqlite":
             schemas = [None]
-        else:
+        elif dialect in ("mysql", "mariadb"):
             schemas = [None]
+        elif dialect == "duckdb":
+            with eng.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name NOT IN ('information_schema', 'pg_catalog')"
+                )).fetchall()
+            schemas = [row[0] for row in rows]
+        else:
+            try:
+                schemas = [schema for schema in insp.get_schema_names()
+                           if schema.lower() not in DEFAULT_SKIP_SCHEMAS]
+            except Exception:
+                schemas = [None]
 
     profile: dict = {"dialect": dialect, "schemas": {}, "url_redacted": _redact(eng.url)}
     for schema in schemas:
@@ -41,13 +54,15 @@ def profile_engine(eng: Engine, schemas: list[str] | None = None, sample: int = 
             names = insp.get_table_names()
         for tname in names:
             t: dict = {}
-            cols = insp.get_columns(tname, schema=schema)
+            metadata = table_metadata(
+                eng, f"{schema}.{tname}" if schema and dialect in SCHEMA_DIALECTS else tname)
+            cols = metadata["columns"]
             t["rowcount"] = _row_count(eng, schema, tname)
             t["columns"] = [
                 {"name": c["name"], "type": str(c["type"]), "nullable": c.get("nullable", True)}
                 for c in cols
             ]
-            t["primary_key"] = insp.get_pk_constraint(tname, schema=schema)["constrained_columns"]
+            t["primary_key"] = metadata["primary_key"]
             t["foreign_keys"] = [
                 {
                     "name": fk["name"],
@@ -56,14 +71,14 @@ def profile_engine(eng: Engine, schemas: list[str] | None = None, sample: int = 
                     "ref_columns": fk["referred_columns"],
                     "ref_schema": fk.get("referred_schema", schema),
                 }
-                for fk in insp.get_foreign_keys(tname, schema=schema)
+                for fk in metadata["foreign_keys"]
             ]
             t["unique_constraints"] = [
                 {
                     "name": u["name"],
                     "columns": u.get("column_names", u.get("constrained_columns", [])),
                 }
-                for u in insp.get_unique_constraints(tname, schema=schema)
+                for u in metadata["unique_constraints"]
             ]
             if sample > 0:
                 _add_sample(eng, schema, tname, [c["name"] for c in cols], t, sample)
@@ -73,22 +88,22 @@ def profile_engine(eng: Engine, schemas: list[str] | None = None, sample: int = 
 
 
 def _row_count(eng: Engine, schema, table: str) -> int:
-    from .connect import quote as qq
-    qual = (f"{qq(schema, eng.dialect.name)}." if schema else "") + qq(table, eng.dialect.name)
     try:
+        table_name = f"{schema}.{table}" if schema and eng.dialect.name in SCHEMA_DIALECTS else table
+        reflected = reflect_table(eng, table_name)
         with eng.connect() as conn:
-            return scalar(conn, f"SELECT COUNT(*) FROM {qual}")
+            return int(conn.execute(select(func.count()).select_from(reflected)).scalar_one())
     except Exception:
         return -1
 
 
 def _add_sample(eng: Engine, schema, table, col_names, t: dict, n: int) -> None:
-    from .connect import quote as qq
-    qual = (f"{qq(schema, eng.dialect.name)}." if schema else "") + qq(table, eng.dialect.name)
     try:
+        table_name = f"{schema}.{table}" if schema and eng.dialect.name in SCHEMA_DIALECTS else table
+        reflected = reflect_table(eng, table_name)
+        statement = select(*(reflected.c[column] for column in col_names)).limit(int(n))
         with eng.connect() as conn:
-            rows = conn.execute(text(f"SELECT {', '.join(qq(c, eng.dialect.name) for c in col_names)} "
-                                     f"FROM {qual} LIMIT {int(n)}")).fetchall()
+            rows = conn.execute(statement).fetchall()
         nulls: dict[str, int] = {c: 0 for c in col_names}
         for row in rows:
             for c, v in zip(col_names, row, strict=True):
@@ -99,9 +114,10 @@ def _add_sample(eng: Engine, schema, table, col_names, t: dict, n: int) -> None:
             {c: (None if v is None else str(v)[:60]) for c, v in zip(col_names, row, strict=True)}
             for row in rows[:3]
         ]
-    except Exception:
+    except Exception as e:
         t["null_rate"] = {}
         t["sample"] = []
+        t["sample_error"] = repr(e)
 
 
 def _redact(url) -> str:

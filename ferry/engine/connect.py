@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 
 
 def make_engine(url: str, defer_fks: bool = False) -> Engine:
@@ -12,6 +13,11 @@ def make_engine(url: str, defer_fks: bool = False) -> Engine:
     defer_fks starts connections with FK enforcement disabled for cycle-breaking waves:
     PG uses session_replication_role=replica (needs superuser), MySQL uses FOREIGN_KEY_CHECKS=0.
     """
+    if make_url(url).get_backend_name() in ("clickhouse", "clickhousedb"):
+        try:
+            import clickhouse_connect.cc_sqlalchemy  # noqa: F401
+        except ImportError as e:
+            raise ValueError("ClickHouse source support requires clickhouse-connect") from e
     eng = create_engine(url, future=True, pool_pre_ping=True)
 
     def _connect(dbapi_conn, _rec):  # pragma: no cover - exercised only on real conns

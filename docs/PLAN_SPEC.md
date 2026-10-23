@@ -4,10 +4,10 @@
 version: 1
 
 source:
-  url: "mysql+pymysql://user:pass@host:3306/db"     # any SQLAlchemy dialect string
+  url: "mysql+pymysql://user@host:3306/db"  # example; use a supported dialect URL
 
 target:
-  url: "postgresql+psycopg://user@host/db"          # PostgreSQL first-class; SQLite supported for tests
+  url: "postgresql+psycopg://user@host/db"
 
 meta:
   schema: ferry_meta          # set false to skip ferry_meta bookkeeping entirely
@@ -20,8 +20,8 @@ order:                          # OPTIONAL: full wave order override (must list 
 on_error: continue              # optional; default abort (writes state then raises)
 
 mappings:                       # one entry per table pair
-- source: user_type             # source table (schema-qualified allowed for PG sources)
-  target: iam.account_types     # target table; PG schema-qualified
+- source: user_type             # source table (schema qualification is dialect-dependent)
+  target: iam.account_types     # target table; schema-qualified for schema-aware dialects
   columns:                      # OPTIONAL source->target column renames
     user_type_id: account_type_id
   skip: [programme_type_id]     # OPTIONAL source columns dropped (or target cols absent)
@@ -36,10 +36,16 @@ mappings:                       # one entry per table pair
 
 ## Dialect support
 
-The implemented dialect paths are PostgreSQL, MySQL, and SQLite. MySQL-to-PostgreSQL is the
-first-class migration path; SQLite is used for local development and tests. Other SQLAlchemy
-dialects are rejected by the executor until their identifier quoting, driver behavior, and
-upsert semantics are implemented and tested.
+Execution accepts PostgreSQL, MySQL/MariaDB, SQLite, CockroachDB, DuckDB, SQL Server, and Oracle as
+sources and targets. ClickHouse is accepted only as a source. Install the matching optional
+dependency extra; SQL Server additionally requires an OS-level ODBC driver. Supported URL schemes
+are `postgresql+psycopg`, `mysql+pymysql` or `mariadb+pymysql`, `sqlite`,
+`cockroachdb+psycopg`, `duckdb`, `mssql+pyodbc`, `oracle+oracledb`, and `clickhousedb+connect`.
+
+The basic source/target, truncate, and merge paths have live integration coverage for PostgreSQL,
+MySQL, MariaDB, CockroachDB, DuckDB, and SQLite. ClickHouse is tested as a source. SQL Server and
+Oracle have adapters but are not yet live-tested by this project. MySQL-to-PostgreSQL is the
+first-class migration path. Target DDL is never created by Ferry.
 
 ## transforms
 - builtin string: `pass strip upper lower null_if_empty safe_date safe_json int float bool_int epoch_to_ts`
@@ -49,7 +55,9 @@ upsert semantics are implemented and tested.
 
 ## semantics worth knowing
 - `truncate` strategy tables are deleted in REVERSE wave order before the topological copy pass.
-- COPY TEXT is used for PG targets (fast path); other targets/dialects use parameterized batches.
+- Rows are streamed from the source in chunks and written with SQLAlchemy Core parameterized
+  batches. PostgreSQL, MySQL, SQLite, and DuckDB use native upsert statements for `merge`; the
+  remaining target dialects use an update-then-insert fallback.
 - resume selects the most recently updated checkpoint unless a run ID is supplied through the API,
   then skips mappings with status `done` (state: `<plan>.yaml.ferry/<run_id>/`).
 - `truncate` verification compares selected source count with target count; `merge` checks that target count
