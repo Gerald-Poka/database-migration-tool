@@ -216,6 +216,82 @@ def test_verify_fails_on_missing_source_table(dbs, tmp_path):
     assert any("error" in count for count in report["counts"])
 
 
+def test_verify_handles_self_referencing_foreign_key(tmp_path):
+    source_path = tmp_path / "self_fk_source.db"
+    target_path = tmp_path / "self_fk_target.db"
+    source_url = f"sqlite:///{source_path}"
+    target_url = f"sqlite:///{target_path}"
+    for url in (source_url, target_url):
+        engine = create_engine(url)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE node (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES node(id))"
+            ))
+            conn.execute(text("INSERT INTO node (id, parent_id) VALUES (1, NULL), (2, 1)"))
+        engine.dispose()
+
+    plan_path = tmp_path / "self_fk_plan.yaml"
+    plan_path.write_text(yaml.safe_dump({
+        "version": 1,
+        "source": {"url": source_url},
+        "target": {"url": target_url},
+        "meta": {"schema": False},
+        "mappings": [{"source": "node", "target": "node", "strategy": "truncate"}],
+    }, sort_keys=False), encoding="utf-8")
+
+    report = verify_plan(Plan.load(plan_path))
+
+    assert report["status"] == "ok"
+    assert len(report["fk_orphans"]) == 1
+    assert report["fk_orphans"][0]["child"] == "node"
+    assert report["fk_orphans"][0]["ref"] == "node"
+    assert report["fk_orphans"][0]["orphans"] == 0
+
+
+def test_merge_batches_do_not_exceed_sqlite_bind_limit(tmp_path):
+    source_path = tmp_path / "large_merge_source.db"
+    target_path = tmp_path / "large_merge_target.db"
+    source_url = f"sqlite:///{source_path}"
+    target_url = f"sqlite:///{target_path}"
+    for url in (source_url, target_url):
+        engine = create_engine(url)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE records (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)"
+            ))
+        engine.dispose()
+
+    source = create_engine(source_url)
+    with source.begin() as conn:
+        conn.execute(
+            text("INSERT INTO records (id, a, b, c) VALUES (:id, :a, :b, :c)"),
+            [{"id": row_id, "a": 1, "b": 2, "c": 3} for row_id in range(16_384)],
+        )
+    source.dispose()
+
+    plan_path = tmp_path / "large_merge_plan.yaml"
+    plan_path.write_text(yaml.safe_dump({
+        "version": 1,
+        "source": {"url": source_url},
+        "target": {"url": target_url},
+        "meta": {"schema": False},
+        "mappings": [{
+            "source": "records",
+            "target": "records",
+            "strategy": "merge",
+            "conflict": "primary",
+        }],
+    }, sort_keys=False), encoding="utf-8")
+
+    report = Executor(Plan.load(plan_path), echo=False).run()
+
+    assert report["summary"]["status"] == "ok"
+    target = create_engine(target_url)
+    with target.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM records")).scalar_one() == 16_384
+    target.dispose()
+
+
 def test_roundtrip_merge_conflict_email(dbs, tmp_path):
     plan_path, tp = dbs
     pl = Plan.load(plan_path)

@@ -68,7 +68,7 @@ def verify_plan(plan: Plan, report_dir: Path | None = None) -> dict:
                 child = reflect_table(tgt, m["target"])
                 ref_name = (f"{ref_schema}.{fk['referred_table']}" if ref_schema
                             else fk["referred_table"])
-                parent = reflect_table(tgt, ref_name)
+                parent = reflect_table(tgt, ref_name).alias("ferry_fk_parent")
                 join = and_(*(child.c[child_col] == parent.c[parent_col]
                               for child_col, parent_col in zip(
                                   fk["constrained_columns"], fk["referred_columns"], strict=True)))

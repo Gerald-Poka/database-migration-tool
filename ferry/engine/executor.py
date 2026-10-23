@@ -330,21 +330,21 @@ class Executor:
                     raise PlanError("DuckDB merge requires the duckdb-engine package") from e
             else:
                 insert_factory = postgresql_insert
-            statement = insert_factory(table).values(rows)
+            statement = insert_factory(table)
             updates = {key: statement.excluded[key] for key in rows[0] if key not in conflict_cols}
             statement = (statement.on_conflict_do_update(
                 index_elements=[table.c[key] for key in conflict_cols], set_=updates)
                 if updates else statement.on_conflict_do_nothing(
                     index_elements=[table.c[key] for key in conflict_cols]))
-            conn.execute(statement)
+            conn.execute(statement, rows)
             return
         if dialect in ("mysql", "mariadb"):
-            statement = mysql_insert(table).values(rows)
+            statement = mysql_insert(table)
             updates = {key: statement.inserted[key] for key in rows[0] if key not in conflict_cols}
             if not updates:
                 key = conflict_cols[0]
                 updates[key] = table.c[key]
-            conn.execute(statement.on_duplicate_key_update(**updates))
+            conn.execute(statement.on_duplicate_key_update(**updates), rows)
             return
 
         mutable_cols = [key for key in rows[0] if key not in conflict_cols]
